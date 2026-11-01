@@ -59,7 +59,7 @@ pcall(function()
 end)
 if type(Config.Tried) ~= "table" then Config.Tried = {} end
 for id, t in pairs(Config.Tried) do
-    if os.time() - t > 600 then Config.Tried[id] = nil end
+    if os.time() - t > 120 then Config.Tried[id] = nil end
 end
 
 ------------------------------------------------------------------
@@ -234,41 +234,77 @@ local function queueScript()
 end
 
 local hopping = false
-TS.TeleportInitFailed:Connect(function() hopping = false end)
+local hopQueue, hopQueueKey, hopQueueAt = {}, nil, 0
+local lastHop = nil
+local TRIED_TTL = 120 -- seconds a failed/used server is skipped
 
-local function hop(key, placeId, onStatus)
+local hop
+
+local function buildQueue(key, onStatus)
+    local entries, dbg = fetchJobs(key)
+    local open, full = {}, {}
+    for _, e in ipairs(entries) do
+        local t = Config.Tried[e.job]
+        if e.job ~= game.JobId and not (t and os.time() - t < TRIED_TTL) then
+            if e.players < e.max then
+                table.insert(open, e)   -- not full (newest first)
+            else
+                table.insert(full, e)   -- logged as full; Roblox rejects it instantly if still full
+            end
+        end
+    end
+    for _, e in ipairs(full) do table.insert(open, e) end
+    hopQueue, hopQueueKey, hopQueueAt = open, key, tick()
+    if #open == 0 and onStatus then
+        if #entries == 0 then
+            onStatus("No server for '" .. key .. "' | " .. tostring(dbg))
+        else
+            onStatus(("Found %d server(s) for '%s' but all were already tried"):format(#entries, key))
+        end
+    end
+end
+
+-- A teleport that fails (server full, etc.) instantly tries the next server
+TS.TeleportInitFailed:Connect(function(_, result, msg)
+    if not alive() then return end
+    hopping = false
+    if lastHop then
+        local h = lastHop
+        if h.onStatus then h.onStatus("Server unavailable (" .. tostring(result) .. "), trying next...") end
+        task.defer(function() hop(h.key, h.placeId, h.onStatus) end)
+    end
+end)
+
+hop = function(key, placeId, onStatus)
     if hopping then return false end
     hopping = true
-    local entries, dbg = fetchJobs(key)
-    local candidates = {}
-    for _, e in ipairs(entries) do
-        if e.job ~= game.JobId and not Config.Tried[e.job] and e.players < e.max then
-            table.insert(candidates, e)
-        end
+    lastHop = { key = key, placeId = placeId, onStatus = onStatus }
+
+    if hopQueueKey ~= key or #hopQueue == 0 or tick() - hopQueueAt > 30 then
+        buildQueue(key, onStatus)
     end
-    if #candidates == 0 then
-        local msg
-        if #entries == 0 then
-            msg = "No server for '" .. key .. "' | " .. tostring(dbg)
-        else
-            msg = ("Found %d server(s) for '%s' but all are full or already tried"):format(#entries, key)
-        end
-        if onStatus then onStatus(msg) end
-        task.delay(5, function() hopping = false end)
+    if #hopQueue == 0 then
+        lastHop = nil
+        task.delay(2, function() hopping = false end)
         return false
     end
-    -- pick one of the 5 newest logs
-    local e = candidates[math.random(math.min(5, #candidates))]
+
+    local e = table.remove(hopQueue, 1)
     Config.Tried[e.job] = os.time()
     saveConfig()
     queueScript()
-    if onStatus then onStatus(("Hopping to a '%s' server (%d/%d)..."):format(key, e.players, e.max)) end
+    if onStatus then onStatus(("Joining '%s' server (%d/%d)..."):format(key, e.players, e.max)) end
     local ok, err = pcall(function()
         TS:TeleportToPlaceInstance(e.place or placeId or game.PlaceId, e.job, LP)
     end)
-    if not ok and onStatus then onStatus("Teleport error: " .. tostring(err):sub(1, 80)) end
-    task.delay(15, function() hopping = false end)
-    return ok
+    if not ok then
+        -- invalid id / immediate error: try the next one right away
+        hopping = false
+        return hop(key, placeId, onStatus)
+    end
+    -- safety: if nothing happens in 20s, allow another attempt
+    task.delay(20, function() hopping = false end)
+    return true
 end
 
 ------------------------------------------------------------------
