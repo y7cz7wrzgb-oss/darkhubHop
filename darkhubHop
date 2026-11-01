@@ -1,0 +1,549 @@
+--[[
+    Dark Hop
+    Tabs: Hop settings | Farm | Hop server
+    Save this file as "DarkHop.lua" in your executor's workspace folder
+    so it can re-execute itself after every server hop (queue_on_teleport).
+]]
+
+repeat task.wait() until game:IsLoaded()
+
+local Players      = game:GetService("Players")
+local RS           = game:GetService("ReplicatedStorage")
+local TS           = game:GetService("TeleportService")
+local HttpService  = game:GetService("HttpService")
+local RunService   = game:GetService("RunService")
+local VIM          = game:GetService("VirtualInputManager")
+local VU           = game:GetService("VirtualUser")
+local LP           = Players.LocalPlayer
+
+------------------------------------------------------------------
+-- Run guard (a new execution kills the previous one)
+------------------------------------------------------------------
+local env = (getgenv and getgenv()) or _G
+if env.DarkHopUI then pcall(function() env.DarkHopUI:Destroy() end) end
+local RUN_ID = tostring(tick())
+env.DarkHopRun = RUN_ID
+local function alive() return env.DarkHopRun == RUN_ID end
+
+------------------------------------------------------------------
+-- Config (persistent: options stay as you left them, even after hops)
+------------------------------------------------------------------
+local CONFIG_FILE = "DarkHop_Config.json"
+local SCRIPT_FILE = "DarkHop.lua"
+local API         = "https://api.quantumonyx.cc/api/logs/"
+local SPEED       = 175
+
+local Config = {
+    Team       = "Marine",
+    FastAttack = true,
+    AutoV3     = false,
+    AutoV4     = false,
+    SelectBoss = "Tyrant of the Skies",
+    FarmBoss   = false,
+    JoinAFK    = false,
+    HopType    = "Full Moon",
+    Tried      = {},
+}
+
+local function saveConfig()
+    pcall(function()
+        if writefile then writefile(CONFIG_FILE, HttpService:JSONEncode(Config)) end
+    end)
+end
+
+pcall(function()
+    if isfile and isfile(CONFIG_FILE) then
+        local data = HttpService:JSONDecode(readfile(CONFIG_FILE))
+        for k, v in pairs(data) do Config[k] = v end
+    end
+end)
+if type(Config.Tried) ~= "table" then Config.Tried = {} end
+for id, t in pairs(Config.Tried) do
+    if os.time() - t > 600 then Config.Tried[id] = nil end
+end
+
+------------------------------------------------------------------
+-- Data
+------------------------------------------------------------------
+local SEA1, SEA2, SEA3 = 2753915549, 4442272183, 7449423635
+
+local Bosses = {
+    ["Tyrant of the Skies"] = { key = "tyrant",        place = SEA3 },
+    ["Dough King"]          = { key = "doughking",     place = SEA3 },
+    ["Cake Queen"]          = { key = "cakequeen",     place = SEA3 },
+    ["Soul Reaper"]         = { key = "soulreaper",    place = SEA3 },
+    ["rip_indra True Form"] = { key = "ripindra",      place = SEA3 },
+    ["Cursed Captain"]      = { key = "cursedcaptain", place = SEA2 },
+    ["Darkbeard"]           = { key = "darkbeard",     place = SEA2 },
+    ["Greybeard"]           = { key = "greybeard",     place = nil },
+}
+local BossList = {
+    "Tyrant of the Skies", "Dough King", "Cake Queen", "Soul Reaper",
+    "rip_indra True Form", "Cursed Captain", "Darkbeard", "Greybeard",
+}
+
+local HopTypes = {
+    ["Full Moon"]           = "fullmoon",
+    ["Near Full Moon"]      = "nearfullmoon",
+    ["Mirage Island"]       = "mirage",
+    ["Elite Hunter"]        = "elites",
+    ["Kitsune Island"]      = "kitsune",
+    ["Prehistoric Island"]  = "prehistoric",
+    ["Factory Raid"]        = "factory",
+    ["4 Hours Uptime"]      = "fourhours",
+    ["Castle / Pirate Raid"] = "pirate",
+    ["Legendary Sword"]     = "legendarysword",
+    ["Fruit Spawned"]       = "fruit",
+    ["Darkbeard"]           = "darkbeard",
+    ["Soul Reaper"]         = "soulreaper",
+    ["Cursed Captain"]      = "cursedcaptain",
+    ["Rip Indra True Form"] = "ripindra",
+    ["Greybeard"]           = "greybeard",
+    ["Cake Queen"]          = "cakequeen",
+    ["Dough King"]          = "doughking",
+    ["Tyrant of the Skies"] = "tyrant",
+}
+local HopTypeList = {
+    "Full Moon", "Near Full Moon", "Mirage Island", "Elite Hunter", "Kitsune Island",
+    "Prehistoric Island", "Factory Raid", "4 Hours Uptime", "Castle / Pirate Raid",
+    "Legendary Sword", "Fruit Spawned", "Darkbeard", "Soul Reaper", "Cursed Captain",
+    "Rip Indra True Form", "Greybeard", "Cake Queen", "Dough King", "Tyrant of the Skies",
+}
+
+if not Bosses[Config.SelectBoss] then Config.SelectBoss = BossList[1] end
+if not HopTypes[Config.HopType] then Config.HopType = HopTypeList[1] end
+
+------------------------------------------------------------------
+-- Helpers
+------------------------------------------------------------------
+local function getRoot()
+    local c = LP.Character
+    return c and c:FindFirstChild("HumanoidRootPart")
+end
+
+local function getHum()
+    local c = LP.Character
+    return c and c:FindFirstChildOfClass("Humanoid")
+end
+
+local function findBoss(name)
+    local en = workspace:FindFirstChild("Enemies")
+    if not en then return nil end
+    for _, m in ipairs(en:GetChildren()) do
+        if m.Name == name then
+            local h = m:FindFirstChildOfClass("Humanoid")
+            if h and h.Health > 0 and m:FindFirstChild("HumanoidRootPart") then
+                return m
+            end
+        end
+    end
+    return nil
+end
+
+------------------------------------------------------------------
+-- Team (applied every time the script runs)
+------------------------------------------------------------------
+local function applyTeam()
+    local remotes = RS:WaitForChild("Remotes", 15)
+    local commF = remotes and remotes:WaitForChild("CommF_", 15)
+    if not commF then return end
+    local t0 = tick()
+    while alive() and not LP.Team and tick() - t0 < 30 do
+        pcall(function()
+            commF:InvokeServer("SetTeam", Config.Team == "Pirate" and "Pirates" or "Marines")
+        end)
+        task.wait(1)
+    end
+end
+
+------------------------------------------------------------------
+-- Server hop (Quantum Onyx API)
+------------------------------------------------------------------
+local GUID = "%x%x%x%x%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%x%x%x%x%x%x%x%x"
+
+local HEADERS = {
+    ["User-Agent"] = "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36",
+    ["Accept"] = "application/json, text/plain, */*",
+}
+
+-- returns body, debugText
+local function httpGet(url)
+    local dbg = "no http function"
+    local req = (syn and syn.request) or request or http_request or (http and http.request)
+    if req then
+        local ok, res = pcall(req, { Url = url, Method = "GET", Headers = HEADERS })
+        if ok and res then
+            local body = res.Body or ""
+            dbg = ("HTTP %s, %d bytes: %s"):format(tostring(res.StatusCode), #body, body:sub(1, 60):gsub("%s+", " "))
+            if body ~= "" and (res.StatusCode == nil or res.StatusCode == 200) then return body, dbg end
+        else
+            dbg = "request error: " .. tostring(res):sub(1, 60)
+        end
+    end
+    local ok, body = pcall(function() return game:HttpGet(url) end)
+    if ok and body and body ~= "" then
+        return body, ("HttpGet, %d bytes: %s"):format(#body, body:sub(1, 60):gsub("%s+", " "))
+    end
+    return nil, dbg .. " | HttpGet failed"
+end
+
+-- returns entries {job, place, players, max, ts}, debugText
+-- API format: {"<key>":[{"timestamp":"...","placeId":"...","jobId":"...","players":"8/12"}, ...]}
+local function fetchJobs(key)
+    local body, dbg = httpGet(API .. key)
+    local entries = {}
+    if not body then return entries, dbg end
+    local ok, data = pcall(function() return HttpService:JSONDecode(body) end)
+    if not ok or type(data) ~= "table" then
+        return entries, "invalid JSON | " .. tostring(dbg)
+    end
+    local list = data[key]
+    if type(list) ~= "table" then
+        for _, v in pairs(data) do
+            if type(v) == "table" then list = v break end
+        end
+    end
+    if type(list) ~= "table" then return entries, "empty list | " .. tostring(dbg) end
+    local byJob = {}
+    for _, e in ipairs(list) do
+        if type(e) == "table" and type(e.jobId) == "string" and e.jobId ~= "" then
+            local cur, max = tostring(e.players or ""):match("(%d+)%s*/%s*(%d+)")
+            local entry = {
+                job = e.jobId,
+                place = tonumber(e.placeId),
+                players = tonumber(cur) or 0,
+                max = tonumber(max) or 12,
+                ts = tostring(e.timestamp or ""),
+            }
+            -- keep only the newest log of each server
+            if not byJob[e.jobId] or entry.ts > byJob[e.jobId].ts then
+                byJob[e.jobId] = entry
+            end
+        end
+    end
+    for _, e in pairs(byJob) do table.insert(entries, e) end
+    table.sort(entries, function(x, y) return x.ts > y.ts end) -- newest first
+    return entries, dbg
+end
+
+local function queueScript()
+    local q = queue_on_teleport or (syn and syn.queue_on_teleport)
+    if q and isfile and isfile(SCRIPT_FILE) then
+        pcall(q, 'loadstring(readfile("' .. SCRIPT_FILE .. '"))()')
+    end
+end
+
+local hopping = false
+TS.TeleportInitFailed:Connect(function() hopping = false end)
+
+local function hop(key, placeId, onStatus)
+    if hopping then return false end
+    hopping = true
+    local entries, dbg = fetchJobs(key)
+    local candidates = {}
+    for _, e in ipairs(entries) do
+        if e.job ~= game.JobId and not Config.Tried[e.job] and e.players < e.max then
+            table.insert(candidates, e)
+        end
+    end
+    if #candidates == 0 then
+        local msg
+        if #entries == 0 then
+            msg = "No server for '" .. key .. "' | " .. tostring(dbg)
+        else
+            msg = ("Found %d server(s) for '%s' but all are full or already tried"):format(#entries, key)
+        end
+        if onStatus then onStatus(msg) end
+        task.delay(5, function() hopping = false end)
+        return false
+    end
+    -- pick one of the 5 newest logs
+    local e = candidates[math.random(math.min(5, #candidates))]
+    Config.Tried[e.job] = os.time()
+    saveConfig()
+    queueScript()
+    if onStatus then onStatus(("Hopping to a '%s' server (%d/%d)..."):format(key, e.players, e.max)) end
+    local ok, err = pcall(function()
+        TS:TeleportToPlaceInstance(e.place or placeId or game.PlaceId, e.job, LP)
+    end)
+    if not ok and onStatus then onStatus("Teleport error: " .. tostring(err):sub(1, 80)) end
+    task.delay(15, function() hopping = false end)
+    return ok
+end
+
+------------------------------------------------------------------
+-- UI
+------------------------------------------------------------------
+local Fluent = loadstring(game:HttpGet("https://github.com/dawid-scripts/Fluent/releases/latest/download/main.lua"))()
+env.DarkHopUI = Fluent
+
+local Window = Fluent:CreateWindow({
+    Title = "Dark Hop",
+    SubTitle = "[Beta]",
+    TabWidth = 140,
+    Size = UDim2.fromOffset(520, 330),
+    Acrylic = false,
+    Theme = "Dark",
+    MinimizeKey = Enum.KeyCode.LeftControl,
+})
+
+local Tabs = {
+    HopSettings = Window:AddTab({ Title = "Hop settings", Icon = "sliders-horizontal" }),
+    Farm        = Window:AddTab({ Title = "Farm",         Icon = "swords" }),
+    HopServer   = Window:AddTab({ Title = "Hop server",   Icon = "server" }),
+}
+
+local function bind(ctrl, key)
+    ctrl:OnChanged(function(v)
+        Config[key] = v
+        saveConfig()
+    end)
+end
+
+-- Hop settings --------------------------------------------------
+local TeamDD = Tabs.HopSettings:AddDropdown("Team", {
+    Title = "Team",
+    Description = "Applied when the script runs",
+    Values = { "Marine", "Pirate" },
+    Multi = false,
+    Default = Config.Team,
+})
+bind(TeamDD, "Team")
+
+bind(Tabs.HopSettings:AddToggle("FastAttack", { Title = "Fast Attack", Default = Config.FastAttack }), "FastAttack")
+bind(Tabs.HopSettings:AddToggle("AutoV3",     { Title = "Auto V3",     Default = Config.AutoV3 }),     "AutoV3")
+bind(Tabs.HopSettings:AddToggle("AutoV4",     { Title = "Auto V4",     Default = Config.AutoV4 }),     "AutoV4")
+
+-- Farm ----------------------------------------------------------
+local BossDD = Tabs.Farm:AddDropdown("SelectBoss", {
+    Title = "Select Boss",
+    Values = BossList,
+    Multi = false,
+    Default = Config.SelectBoss,
+})
+bind(BossDD, "SelectBoss")
+
+bind(Tabs.Farm:AddToggle("FarmBoss", { Title = "Farm Boss", Default = Config.FarmBoss }), "FarmBoss")
+bind(Tabs.Farm:AddToggle("JoinAFK",  { Title = "Join afk Boss server", Default = Config.JoinAFK }), "JoinAFK")
+
+local StatusP = Tabs.Farm:AddParagraph({ Title = "Status", Content = "Starting..." })
+local lastStatus = ""
+local hopMsg, hopMsgAt = nil, 0
+local function setStatus(text)
+    if text == lastStatus then return end
+    lastStatus = text
+    pcall(function() StatusP:SetDesc(text) end)
+end
+
+-- Hop server ----------------------------------------------------
+local HopDD = Tabs.HopServer:AddDropdown("HopType", {
+    Title = "Server type",
+    Values = HopTypeList,
+    Multi = false,
+    Default = Config.HopType,
+})
+bind(HopDD, "HopType")
+
+local HopStatusP = Tabs.HopServer:AddParagraph({ Title = "Status", Content = "Idle" })
+local function setHopStatus(text)
+    pcall(function() HopStatusP:SetDesc(text) end)
+end
+
+Tabs.HopServer:AddButton({
+    Title = "Hop server",
+    Description = "Join a server of the selected type",
+    Callback = function()
+        local key = HopTypes[Config.HopType]
+        local boss = Bosses[Config.HopType]
+        setHopStatus("Searching...")
+        hop(key, boss and boss.place or nil, setHopStatus)
+    end,
+})
+
+Window:SelectTab(2)
+
+------------------------------------------------------------------
+-- Anti AFK
+------------------------------------------------------------------
+LP.Idled:Connect(function()
+    pcall(function()
+        VU:CaptureController()
+        VU:ClickButton2(Vector2.new())
+    end)
+end)
+
+------------------------------------------------------------------
+-- Farm engine
+------------------------------------------------------------------
+local farmTarget = nil
+
+-- movement (fly at 175) + noclip
+RunService.Heartbeat:Connect(function(dt)
+    if not alive() then return end
+    local root = getRoot()
+    if not root or not farmTarget then return end
+    local tr = farmTarget:FindFirstChild("HumanoidRootPart")
+    if not tr then return end
+    local goal = tr.Position + Vector3.new(0, 18, 0)
+    local d = goal - root.Position
+    local step = SPEED * dt
+    local newPos = (d.Magnitude <= step) and goal or (root.Position + d.Unit * step)
+    local rot = root.CFrame - root.CFrame.Position
+    root.CFrame = CFrame.new(newPos) * rot
+    root.AssemblyLinearVelocity = Vector3.zero
+end)
+
+RunService.Stepped:Connect(function()
+    if not alive() or not farmTarget then return end
+    local c = LP.Character
+    if not c then return end
+    for _, p in ipairs(c:GetDescendants()) do
+        if p:IsA("BasePart") then p.CanCollide = false end
+    end
+end)
+
+local function equipWeapon()
+    local c, hum = LP.Character, getHum()
+    if not c or not hum then return end
+    -- already holding the melee? nothing to do
+    local held = c:FindFirstChildOfClass("Tool")
+    if held and held.ToolTip == "Melee" then return end
+    -- otherwise find the melee in the backpack and equip it
+    for _, t in ipairs(LP.Backpack:GetChildren()) do
+        if t:IsA("Tool") and t.ToolTip == "Melee" then
+            hum:EquipTool(t)
+            return
+        end
+    end
+end
+
+local function enableHaki()
+    local c = LP.Character
+    if not c or c:FindFirstChild("HasBuso") then return end
+    pcall(function() RS.Remotes.CommF_:InvokeServer("Buso") end)
+end
+
+local Net = RS:FindFirstChild("Modules") and RS.Modules:FindFirstChild("Net")
+local RegAttack = Net and Net:FindFirstChild("RE/RegisterAttack")
+local RegHit    = Net and Net:FindFirstChild("RE/RegisterHit")
+
+local function attack(enemy)
+    local c = LP.Character
+    local tool = c and c:FindFirstChildOfClass("Tool")
+    if not tool then return end
+    if Config.FastAttack and RegAttack and RegHit then
+        local part = enemy:FindFirstChild("Head") or enemy:FindFirstChild("HumanoidRootPart")
+        pcall(function()
+            RegAttack:FireServer(0)
+            RegHit:FireServer(part, { { enemy, part } })
+        end)
+    end
+    -- normal click as well (works with fruit M1, melee and sword)
+    pcall(function()
+        VU:CaptureController()
+        VU:Button1Down(Vector2.new(1280, 672))
+        VU:Button1Up(Vector2.new(1280, 672))
+    end)
+    pcall(function() tool:Activate() end)
+end
+
+-- boss logic
+task.spawn(function()
+    while alive() do
+        task.wait(0.2)
+        local name = Config.SelectBoss
+        local boss = Config.FarmBoss and findBoss(name) or nil
+        if boss then
+            farmTarget = boss
+            setStatus("Killing " .. name)
+            equipWeapon()
+            enableHaki()
+        else
+            farmTarget = nil
+            if Config.FarmBoss and not Config.JoinAFK then
+                setStatus("Waiting for " .. name .. " to spawn")
+            elseif not Config.JoinAFK then
+                setStatus("Idle")
+            end
+        end
+    end
+end)
+
+-- attack loop
+task.spawn(function()
+    while alive() do
+        task.wait(Config.FastAttack and 0.1 or 0.35)
+        local t = farmTarget
+        if t and t.Parent then
+            local hum = t:FindFirstChildOfClass("Humanoid")
+            local root = getRoot()
+            local tr = t:FindFirstChild("HumanoidRootPart")
+            if hum and hum.Health > 0 and root and tr and (root.Position - tr.Position).Magnitude < 80 then
+                attack(t)
+            end
+        end
+    end
+end)
+
+-- afk boss server hop:
+-- hops 3 seconds after being enabled / after joining a server, and only hops
+-- again when the selected boss is dead or gone
+task.spawn(function()
+    local ready = false
+    repeat task.wait(0.5) until not alive() or (LP.Character and getRoot())
+    ready = true
+    local absentSince = nil
+    while alive() do
+        task.wait(0.5)
+        if Config.JoinAFK and ready then
+            local name = Config.SelectBoss
+            if findBoss(name) then
+                absentSince = nil
+                if not Config.FarmBoss then setStatus(name .. " is alive in this server") end
+            else
+                absentSince = absentSince or tick()
+                local left = 3 - (tick() - absentSince)
+                if hopMsg and tick() - hopMsgAt < 8 then
+                    setStatus(hopMsg)
+                elseif left > 0 then
+                    setStatus(("%s not found, hopping in %.0fs"):format(name, math.ceil(left)))
+                else
+                    absentSince = nil
+                    local info = Bosses[name]
+                    hop(info.key, info.place, function(t)
+                        hopMsg, hopMsgAt = t, tick()
+                        setStatus(t)
+                    end)
+                end
+            end
+        else
+            absentSince = nil
+        end
+    end
+end)
+
+-- Auto V3 / V4
+task.spawn(function()
+    while alive() do
+        task.wait(4)
+        if Config.AutoV3 then
+            pcall(function() RS.Remotes.CommE:FireServer("ActivateAbility") end)
+        end
+        if Config.AutoV4 then
+            pcall(function()
+                VIM:SendKeyEvent(true, Enum.KeyCode.Y, false, game)
+                task.wait(0.1)
+                VIM:SendKeyEvent(false, Enum.KeyCode.Y, false, game)
+            end)
+        end
+    end
+end)
+
+-- team on every execution
+task.spawn(applyTeam)
+
+Fluent:Notify({
+    Title = "Dark Hop",
+    Content = "Loaded. Your options were restored.",
+    Duration = 4,
+})
